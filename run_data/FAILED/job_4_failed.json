@@ -1,0 +1,9 @@
+[
+  {
+    "job_id": 4,
+    "row_index": 12636,
+    "scno": "115752C307000164",
+    "error": "('Connection aborted.', ConnectionResetError(10054, 'An existing connection was forcibly closed by the remote host', None, 10054, None))",
+    "ts": 1770093567
+  }
+]

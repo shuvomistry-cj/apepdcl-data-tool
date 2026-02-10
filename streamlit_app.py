@@ -428,6 +428,15 @@ def build_input_excel_bytes(cids: List[str]) -> bytes:
 
 
 
+@st.cache_data(show_spinner=True, ttl=60)
+def _build_job_output_csv_bytes_cached(db_path: str, job_id: int) -> bytes:
+
+    df_out = build_scraped_output_dataframe(db_path, int(job_id))
+
+    return df_out.to_csv(index=False).encode("utf-8-sig")
+
+
+
 
 
 def ensure_parent_dir(path: str) -> None:
@@ -888,6 +897,13 @@ def list_preprocessed_files(db_path: str, limit: int = 20) -> pd.DataFrame:
 
 
 
+@st.cache_data(show_spinner=False, ttl=5)
+def _list_scrape_jobs_cached(db_path: str, limit: int = 50) -> pd.DataFrame:
+
+    return list_scrape_jobs(db_path, limit=limit)
+
+
+
 
 
 def get_preprocessed_columns(db_path: str, file_id: int) -> List[str]:
@@ -1170,6 +1186,15 @@ def _build_job_unscraped_bytes_cached(db_path: str, job_id: int) -> bytes:
 
 
 
+@st.cache_data(show_spinner=True, ttl=60)
+def _build_job_unscraped_csv_bytes_cached(db_path: str, job_id: int) -> bytes:
+
+    df_uns = get_unscraped_cleaned_dataframe(db_path, int(job_id))
+
+    return df_uns.to_csv(index=False).encode("utf-8-sig")
+
+
+
 
 
 def update_job_status(db_path: str, job_id: int, status: str, last_error: Optional[str] = None) -> None:
@@ -1426,69 +1451,137 @@ def build_scraped_output_dataframe(db_path: str, job_id: int) -> pd.DataFrame:
 
         )
 
-        res = conn.execute(
+        status_df = pd.read_sql_query(
 
-            "SELECT row_index, scraped_json, status FROM scraped_results WHERE job_id = ?",
+            """
 
-            (int(job_id),),
+            SELECT row_index, status, error, updated_at_utc
 
-        ).fetchall()
+            FROM scraped_results
+
+            WHERE job_id = ?
+
+            """,
+
+            conn,
+
+            params=(int(job_id),),
+
+        )
+
+        res_df = pd.read_sql_query(
+
+            """
+
+            SELECT row_index, scraped_json
+
+            FROM scraped_results
+
+            WHERE job_id = ? AND status = 'success'
+
+            """,
+
+            conn,
+
+            params=(int(job_id),),
+
+        )
 
 
 
-    months = set()
 
-    parsed = {}
+    out_df = base_df
 
-    for row_index, scraped_json, status in res:
-
-        if status != "success":
-
-            continue
+    if not status_df.empty:
 
         try:
 
-            data = json.loads(scraped_json) if scraped_json else {}
+            status_df["row_index"] = status_df["row_index"].astype(int)
 
         except Exception:
 
-            data = {}
+            pass
 
-        parsed[int(row_index)] = data
+        status_df = status_df.sort_values(by=["row_index", "updated_at_utc"], ascending=[True, True])
 
-        for k in data.keys():
+        status_df = status_df.drop_duplicates(subset=["row_index"], keep="last")
 
-            months.add(k)
+        status_df = status_df.rename(
 
+            columns={
 
+                "row_index": "__row_index",
 
-    # To match Sample Scraped Output ordering (reverse-sorted seems used in vsk2 pivot), but keep stable.
+                "status": "SCRAPE_STATUS",
 
-    month_cols = sorted(list(months), reverse=True)
+                "error": "SCRAPE_ERROR",
 
-    for m in month_cols:
+            }
 
-        base_df[m] = None
+        )
 
+        out_df = out_df.merge(status_df[["__row_index", "SCRAPE_STATUS", "SCRAPE_ERROR"]], on="__row_index", how="left")
 
+    else:
 
-    for idx, data in parsed.items():
+        out_df["SCRAPE_STATUS"] = None
 
-        for m, val in data.items():
+        out_df["SCRAPE_ERROR"] = None
+
+    if not res_df.empty:
+
+        rows: List[dict] = []
+
+        for row_index, scraped_json in res_df.itertuples(index=False):
 
             try:
 
-                base_df.loc[base_df["__row_index"] == idx, m] = val
+                data = json.loads(scraped_json) if scraped_json else {}
 
             except Exception:
 
-                pass
+                data = {}
+
+            if not isinstance(data, dict) or not data:
+
+                continue
+
+            d = {"__row_index": int(row_index)}
+
+            d.update(data)
+
+            rows.append(d)
+
+        if rows:
+
+            scraped_wide = pd.DataFrame(rows)
+
+            scraped_wide = scraped_wide.drop_duplicates(subset=["__row_index"], keep="last")
+
+            month_cols = sorted([c for c in scraped_wide.columns if c != "__row_index"], reverse=True)
+
+            scraped_wide = scraped_wide[["__row_index"] + month_cols]
+
+            out_df = out_df.merge(scraped_wide, on="__row_index", how="left")
+
+            base_cols = [c for c in base_df.columns if c != "__row_index"]
+
+            base_cols = [c for c in base_cols if c not in {"SCRAPE_STATUS", "SCRAPE_ERROR"}]
+
+            out_df = out_df[base_cols + ["SCRAPE_STATUS", "SCRAPE_ERROR"] + month_cols]
+
+            return out_df
+
+    out_df = out_df.drop(columns=["__row_index"])
+
+    return out_df
 
 
 
-    base_df = base_df.drop(columns=["__row_index"])
+@st.cache_data(show_spinner=False, ttl=30)
+def _build_job_preview_df_cached(db_path: str, job_id: int) -> pd.DataFrame:
 
-    return base_df
+    return build_scraped_output_dataframe(db_path, job_id).head(30)
 
 
 
@@ -1527,6 +1620,10 @@ class JobRunner:
         self._queue_lock = threading.Lock()
 
         self._min_row_index: Optional[int] = None
+
+        self._err_lock = threading.Lock()
+
+        self._fatal_errors: List[str] = []
 
 
 
@@ -1664,13 +1761,17 @@ class JobRunner:
 
                 try:
 
-                    update_job_status(self.db_path, self.job_id, "Stopped", last_error=str(last_exc))
+                    with self._err_lock:
+
+                        self._fatal_errors.append(str(last_exc))
 
                 except Exception:
 
                     pass
 
                 return None
+
+
 
             driver = new_driver_with_retries()
 
@@ -1679,8 +1780,6 @@ class JobRunner:
                 return
 
             consecutive_driver_failures = 0
-
-
 
             while not self._stop_event.is_set():
 
@@ -1747,13 +1846,14 @@ class JobRunner:
                     driver = new_driver_with_retries()
 
                     if driver is None:
-
                         return
 
                     if consecutive_driver_failures >= 10:
-
-                        update_job_status(self.db_path, self.job_id, "Stopped", last_error="Repeated browser session loss")
-
+                        try:
+                            with self._err_lock:
+                                self._fatal_errors.append("Repeated browser session loss")
+                        except Exception:
+                            pass
                         return
 
                     continue
@@ -1835,6 +1935,26 @@ class JobRunner:
             if not remaining:
 
                 update_job_status(self.db_path, self.job_id, "Done")
+
+                return
+
+            # Tasks remain but all threads finished -> treat as stopped/fatal.
+
+            last_error = None
+
+            try:
+
+                with self._err_lock:
+
+                    if self._fatal_errors:
+
+                        last_error = self._fatal_errors[-1]
+
+            except Exception:
+
+                last_error = None
+
+            update_job_status(self.db_path, self.job_id, "Stopped", last_error=last_error)
 
 
 
@@ -3076,7 +3196,7 @@ with tab_history:
 
 
 
-    jobs_df = list_scrape_jobs(db_path, limit=50)
+    jobs_df = _list_scrape_jobs_cached(db_path, limit=50)
 
     if jobs_df.empty:
 
@@ -3270,7 +3390,11 @@ with tab_history:
 
                 data = _build_job_output_bytes_cached(db_path, jid)
 
-                st.download_button(
+                data_csv = _build_job_output_csv_bytes_cached(db_path, jid)
+
+                d1, d2 = st.columns(2)
+
+                d1.download_button(
 
                     "Download scraped Excel",
 
@@ -3284,11 +3408,29 @@ with tab_history:
 
                 )
 
+                d2.download_button(
+
+                    "Download scraped CSV",
+
+                    data=data_csv,
+
+                    file_name=f"scraped_job_{jid}.csv",
+
+                    mime="text/csv",
+
+                    key=f"job_dl_csv_ready_{jid}",
+
+                )
+
             else:
 
                 data = _build_job_unscraped_bytes_cached(db_path, jid)
 
-                st.download_button(
+                data_csv = _build_job_unscraped_csv_bytes_cached(db_path, jid)
+
+                d1, d2 = st.columns(2)
+
+                d1.download_button(
 
                     "Download unscraped Excel",
 
@@ -3299,6 +3441,20 @@ with tab_history:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 
                     key=f"job_dl_uns_ready_{jid}",
+
+                )
+
+                d2.download_button(
+
+                    "Download unscraped CSV",
+
+                    data=data_csv,
+
+                    file_name=f"unscraped_job_{jid}.csv",
+
+                    mime="text/csv",
+
+                    key=f"job_dl_uns_csv_ready_{jid}",
 
                 )
 
@@ -3380,33 +3536,32 @@ with tab_history:
 
 
 
-                retryable_count = None
-
-                try:
-
-                    # Count rows that will actually be retried (only non-success rows, optionally filtered by mode).
-
-                    q_all = get_unscraped_rows(db_path, jid, int(det.get("file_id")), str(det.get("scno_column")))
-
-                    if restart_mode == "Continue from last attempted row" and continue_from is not None:
-
-                        q_all = [t for t in q_all if int(t[0]) >= int(continue_from)]
-
-                    elif restart_mode != "Continue from last attempted row" and first_missing_success is not None:
-
-                        q_all = [t for t in q_all if int(t[0]) >= int(first_missing_success)]
-
-                    retryable_count = len(q_all)
-
-                except Exception:
+                if st.button("Calculate retryable rows", key=f"retryable_calc_{jid}"):
 
                     retryable_count = None
 
+                    try:
 
+                        # Expensive on large datasets: only run on-demand.
+                        q_all = get_unscraped_rows(db_path, jid, int(det.get("file_id")), str(det.get("scno_column")))
 
-                if retryable_count is not None:
+                        if restart_mode == "Continue from last attempted row" and continue_from is not None:
 
-                    st.write({"retryable_rows": retryable_count})
+                            q_all = [t for t in q_all if int(t[0]) >= int(continue_from)]
+
+                        elif restart_mode != "Continue from last attempted row" and first_missing_success is not None:
+
+                            q_all = [t for t in q_all if int(t[0]) >= int(first_missing_success)]
+
+                        retryable_count = len(q_all)
+
+                    except Exception:
+
+                        retryable_count = None
+
+                    if retryable_count is not None:
+
+                        st.write({"retryable_rows": retryable_count})
 
 
 

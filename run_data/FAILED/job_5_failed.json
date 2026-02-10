@@ -1,0 +1,30 @@
+[
+  {
+    "job_id": 5,
+    "row_index": 255,
+    "scno": "115752C324000427",
+    "error": "CAPTCHA failed or no history button",
+    "ts": 1770094880
+  },
+  {
+    "job_id": 5,
+    "row_index": 256,
+    "scno": "115752C301000230",
+    "error": "CAPTCHA failed or no history button",
+    "ts": 1770094881
+  },
+  {
+    "job_id": 5,
+    "row_index": 257,
+    "scno": "115752C322000121",
+    "error": "CAPTCHA failed or no history button",
+    "ts": 1770094883
+  },
+  {
+    "job_id": 5,
+    "row_index": 261,
+    "scno": "1157522301000175",
+    "error": "('Connection aborted.', ConnectionResetError(10054, 'An existing connection was forcibly closed by the remote host', None, 10054, None))",
+    "ts": 1770094884
+  }
+]
